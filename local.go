@@ -8,6 +8,11 @@ type localState struct {
 	repos map[string]*models.Repo
 }
 
+var sigShaMap map[string]string
+var sigOwners map[string]string
+var repos map[string]string
+var sigRepos map[string][]string
+
 func (r *localState) getOrNewRepo(repo string) *models.Repo {
 	if v, ok := r.repos[repo]; ok {
 		return v

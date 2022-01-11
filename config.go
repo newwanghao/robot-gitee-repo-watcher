@@ -37,9 +37,6 @@ type watchingFiles struct {
 	// RepoFilePath is the path to repo file. For example: repository/openeuler.yaml
 	RepoFilePath string `json:"repo_file_path" required:"true"`
 
-	// SigFilePath is the path to sig file. For example: sig/sigs.yaml
-	SigFilePath string `json:"sig_file_path" required:"true"`
-
 	// SigDir is the directory which includes all the sigs. For example: sig
 	SigDir string `json:"sig_dir" required:"true"`
 }

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -23,16 +25,23 @@ func (e *expectRepoInfo) getNewRepoName() string {
 func (bot *robot) run(ctx context.Context, log *logrus.Entry) error {
 	w := &bot.cfg.WatchingFiles
 	expect := &expectState{
-		w:         w.repoBranch,
-		log:       log,
-		cli:       bot.cli,
-		sigOwners: make(map[string]*expectSigOwners),
+		w:   w.repoBranch,
+		log: log,
+		cli: bot.cli,
+		sigDir: w.SigDir,
 	}
 
-	org, err := expect.init(w.RepoFilePath, w.SigFilePath, w.SigDir)
+	err := bot.initSigShaAndAllReposFiles(w)
+	if err != nil {
+		log.Errorf("list all files failed: %v", err)
+	}
+
+	err = expect.loadFileToLocal()
 	if err != nil {
 		return err
 	}
+
+	org := w.RepoFilePath
 
 	local, err := bot.loadALLRepos(org)
 	if err != nil {
@@ -137,4 +146,71 @@ func isCancelled(ctx context.Context) bool {
 	default:
 		return false
 	}
+}
+
+// 初始化仓库的文件路径
+func (bot *robot) initSigShaAndAllReposFiles(w *watchingFiles) error {
+	trees, err := bot.cli.GetDirectoryTree(w.Org, w.Repo, w.Branch, 1)
+
+	if err != nil || len(trees.Tree) == 0 {
+		return err
+	}
+
+	repos = make(map[string]string)
+	sigOwners = make(map[string]string)
+	sigShaMap = make(map[string]string)
+	sigRepos = make(map[string][]string)
+
+	for i := range trees.Tree {
+		item := &trees.Tree[i]
+		if strings.HasPrefix(item.Path, w.SigDir) && strings.Count(item.Path, "/") == 4 &&
+			strings.Split(item.Path, "/")[2] == w.RepoFilePath{
+			repos[strings.Split(item.Path, ".yaml")[0]] = item.Sha
+			sigRepos[strings.Split(item.Path, "/")[1]] =
+				append(sigRepos[strings.Split(item.Path, "/")[1]], strings.Split(strings.Split(item.Path, "/")[4], ".yaml")[0])
+		} else if item.Path == w.SigDir {
+			sigShaMap[item.Path] = item.Sha
+		} else if strings.HasSuffix(item.Path, "OWNERS") {
+			sigOwners[item.Path] = item.Sha
+		}
+	}
+
+	return nil
+}
+
+func (e *expectState) loadFileToLocal() error {
+	t := time.Now()
+	community.ReposMap = make(map[string]*community.Repository)
+	for k := range repos {
+		c, err := e.loadFile(fmt.Sprintf("%s.yaml", k))
+		if err != nil {
+			return err
+		}
+
+		v := &community.Repository{}
+		err = decodeYamlFile(c, v)
+		if err != nil {
+			return err
+		}
+
+		community.ReposMap[v.Name] = v
+	}
+
+	community.ReposOwners = make(map[string]*community.RepoOwners)
+	for j := range sigOwners {
+		c, err := e.loadFile(j)
+		if err != nil {
+			return err
+		}
+
+		v := &community.RepoOwners{}
+		err = decodeYamlFile(c, v)
+		if err != nil {
+			return err
+		}
+
+		community.ReposOwners[strings.Split(j, "/")[1]] = v
+	}
+
+	return nil
 }

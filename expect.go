@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"fmt"
-	"path"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -12,119 +12,12 @@ import (
 	"github.com/opensourceways/robot-gitee-repo-watcher/community"
 )
 
-type watchingFileObject interface {
-	Validate() error
-}
-
-type watchingFile struct {
-	log      *logrus.Entry
-	loadFile func(string) (string, string, error)
-
-	file string
-	sha  string
-	obj  watchingFileObject
-}
-
-type getSHAFunc func(string) string
-
-func (w *watchingFile) update(f getSHAFunc, newObject func() watchingFileObject) {
-	if sha := f(w.file); sha == "" || sha == w.sha {
-		return
-	}
-
-	c, sha, err := w.loadFile(w.file)
-	if err != nil {
-		w.log.Errorf("load file:%s, err:%s", w.file, err.Error())
-		return
-	}
-
-	v := newObject()
-
-	if err := decodeYamlFile(c, v); err != nil {
-		w.log.Errorf("decode file:%s, err:%s", w.file, err.Error())
-		return
-	}
-
-	if err := v.Validate(); err != nil {
-		w.log.Errorf("validate the data of file:%s, err:%s", w.file, err.Error())
-	} else {
-		w.obj = v
-		w.sha = sha
-	}
-}
-
-type expectRepos struct {
-	wf watchingFile
-}
-
-func (e *expectRepos) refresh(f getSHAFunc) *community.Repos {
-	e.wf.update(f, func() watchingFileObject {
-		return new(community.Repos)
-	})
-
-	if v, ok := e.wf.obj.(*community.Repos); ok {
-		return v
-	}
-	return nil
-}
-
-type orgSigs struct {
-	wf watchingFile
-}
-
-func (s *orgSigs) refresh(f getSHAFunc) *community.Sigs {
-	s.wf.update(f, func() watchingFileObject {
-		return new(community.Sigs)
-	})
-
-	if v, ok := s.wf.obj.(*community.Sigs); ok {
-		return v
-	}
-	return nil
-}
-
-type expectSigOwners struct {
-	wf watchingFile
-}
-
-func (e *expectSigOwners) refresh(f getSHAFunc) *community.RepoOwners {
-	e.wf.update(f, func() watchingFileObject {
-		return new(community.RepoOwners)
-	})
-
-	if v, ok := e.wf.obj.(*community.RepoOwners); ok {
-		return v
-	}
-	return nil
-}
-
 type expectState struct {
 	log *logrus.Entry
 	cli iClient
 
-	w         repoBranch
-	sig       orgSigs
-	repos     expectRepos
-	sigDir    string
-	sigOwners map[string]*expectSigOwners
-}
-
-func (e *expectState) init(repoFilePath, sigFilePath, sigDir string) (string, error) {
-	e.repos = expectRepos{e.newWatchingFile(repoFilePath)}
-
-	v := e.repos.refresh(func(string) string {
-		return "init"
-	})
-
-	org := v.GetCommunity()
-	if org == "" {
-		return "", fmt.Errorf("load repository failed")
-	}
-
-	e.sig = orgSigs{e.newWatchingFile(sigFilePath)}
-	e.sigDir = sigDir
-
-	return org, nil
+	w repoBranch
+	sigDir string
 }
 
 func (e *expectState) check(
@@ -133,6 +26,14 @@ func (e *expectState) check(
 	clearLocal func(func(string) bool),
 	checkRepo func(*community.Repository, []string, *logrus.Entry),
 ) {
+	newSigSha := getFirstLevelFilesSha(e)
+
+	// refresh sigSha
+	if sigShaMap[e.sigDir] == newSigSha {
+		e.log.Info("there are no changes in sig directory")
+	}
+	sigShaMap[e.sigDir] = newSigSha
+
 	allFiles, err := e.listAllFilesOfRepo()
 	if err != nil {
 		e.log.Errorf("list all file, err:%s", err.Error())
@@ -140,12 +41,81 @@ func (e *expectState) check(
 		allFiles = make(map[string]string)
 	}
 
-	getSHA := func(p string) string {
-		return allFiles[p]
+	// get yaml file path in allFiles but not in repos and get yaml file path which sha has changed and refresh repos
+	changedRepoFilesPaths := e.getChangedRepoFilesPaths(allFiles, repos, org)
+	changedSigOwnersPaths := e.getChangedOwnersFilesPaths(allFiles, sigOwners)
+
+	if len(changedRepoFilesPaths) == 0 && len(changedSigOwnersPaths) == 0 {
+		e.log.Info("yaml or OWNERS file has not been changed")
+		existRepos := make(map[string]string, 0)
+		items, err := e.cli.GetRepos(org)
+		if err != nil {
+			return
+		}
+
+		for i := range items {
+			item := &items[i]
+			existRepos[item.Path] = item.Name
+		}
+
+		for k := range allFiles {
+			if strings.Count(k, "/") == 4 && strings.HasSuffix(k, ".yaml") {
+				s := strings.Split(strings.Split(k, ".yaml")[0], "/")[4]
+				if _, ok := existRepos[s]; ok {
+					continue
+				} else {
+					delete(repos, strings.Split(k, ".yaml")[0])
+					delete(community.ReposMap, strings.Split(strings.Split(k, ".yaml")[0], "/")[4])
+
+					key := strings.Split(k, "/")[1]
+					for i := 0; i < len(sigRepos[key]); i++ {
+						if sigRepos[key][i] == s {
+							sigRepos[key] = append(sigRepos[key][:i], sigRepos[key][i+1:]...)
+							i--
+						}
+					}
+				}
+			}
+		}
 	}
 
-	allRepos := e.repos.refresh(getSHA)
-	repoMap := allRepos.GetRepos()
+	if len(changedRepoFilesPaths) > 0 {
+		for k := range changedRepoFilesPaths {
+			c, err := e.loadFile(k)
+			if err != nil {
+				e.log.Warning("can't load file")
+				continue
+			}
+
+			v := &community.Repository{}
+			err = decodeYamlFile(c, v)
+			if err != nil {
+				e.log.Warning("can't decode file")
+				continue
+			}
+			community.ReposMap[v.Name] = v
+		}
+	}
+
+	if len(changedSigOwnersPaths) > 0 {
+		for k := range changedSigOwnersPaths {
+			if strings.HasSuffix(k, "OWNERS") {
+				c, err := e.loadFile(k)
+				if err != nil {
+					e.log.Warning("can't load file")
+				}
+
+				v := &community.RepoOwners{}
+				err = decodeYamlFile(c, v)
+				if err != nil {
+					e.log.Warning("can't decode file")
+				}
+				community.ReposOwners[strings.Split(k, "/")[1]] = v
+			}
+		}
+	}
+
+	repoMap := community.ReposMap
 
 	if len(repoMap) == 0 {
 		// keep safe to do this. it is impossible to happen generally.
@@ -157,26 +127,21 @@ func (e *expectState) check(
 		_, ok := repoMap[r]
 		return ok
 	})
-
 	done := sets.NewString()
-	allSigs := e.sig.refresh(getSHA)
-	sigs := allSigs.GetSigs()
-	for i := range sigs {
-		sig := &sigs[i]
 
-		sigOwner := e.getSigOwner(sig.Name)
-		owners := sigOwner.refresh(getSHA)
+	for sigName, v := range sigRepos {
+		owners := toLowerOfMembers(community.ReposOwners[sigName].Maintainers)
 
-		for _, repoName := range sig.GetRepos(org) {
+		for _, repoName := range v {
 			if isStopped() {
 				break
 			}
 
-			if org == "openeuler" && repoName == "blog" {
+			if org == "repo-watch" && repoName == "blog" {
 				continue
 			}
 
-			checkRepo(repoMap[repoName], owners.GetOwners(), e.log)
+			checkRepo(community.ReposMap[repoName], owners, e.log)
 
 			done.Insert(repoName)
 		}
@@ -205,29 +170,6 @@ func (e *expectState) check(
 	}
 }
 
-func (e *expectState) getSigOwner(sigName string) *expectSigOwners {
-	o, ok := e.sigOwners[sigName]
-	if !ok {
-		o = &expectSigOwners{
-			wf: e.newWatchingFile(
-				path.Join(e.sigDir, sigName, "OWNERS"),
-			),
-		}
-
-		e.sigOwners[sigName] = o
-	}
-
-	return o
-}
-
-func (e *expectState) newWatchingFile(p string) watchingFile {
-	return watchingFile{
-		file:     p,
-		log:      e.log,
-		loadFile: e.loadFile,
-	}
-}
-
 func (e *expectState) listAllFilesOfRepo() (map[string]string, error) {
 	trees, err := e.cli.GetDirectoryTree(e.w.Org, e.w.Repo, e.w.Branch, 1)
 	if err != nil || len(trees.Tree) == 0 {
@@ -243,13 +185,13 @@ func (e *expectState) listAllFilesOfRepo() (map[string]string, error) {
 	return r, nil
 }
 
-func (e *expectState) loadFile(f string) (string, string, error) {
+func (e *expectState) loadFile(f string) (string, error) {
 	c, err := e.cli.GetPathContent(e.w.Org, e.w.Repo, f, e.w.Branch)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 
-	return c.Content, c.Sha, nil
+	return c.Content, nil
 }
 
 func decodeYamlFile(content string, v interface{}) error {
@@ -259,4 +201,120 @@ func decodeYamlFile(content string, v interface{}) error {
 	}
 
 	return yaml.Unmarshal(c, v)
+}
+
+func (e *expectState) getChangedRepoFilesPaths(allFiles, compareFiles map[string]string, org string) map[string]string {
+	r := make(map[string]string, 0)
+
+	e.removeDeletedRepos(allFiles, org)
+
+	for k, v := range allFiles {
+		if strings.HasPrefix(k, e.sigDir) && !strings.HasSuffix(k, ".md") &&
+			strings.Count(k, "/") == 4 && strings.Split(k, "/")[2] == org {
+			if _, ok := compareFiles[strings.Split(k, ".yaml")[0]]; ok {
+				if compareFiles[strings.Split(k, ".yaml")[0]] != v {
+					r[k] = v
+					compareFiles[strings.Split(k, ".yaml")[0]] = v
+				}
+			} else {
+				r[k] = v
+				compareFiles[strings.Split(k, ".yaml")[0]] = v
+			}
+
+			if v, ok := sigRepos[strings.Split(k, "/")[1]]; ok {
+				in := findInSlice(v, strings.Split(strings.Split(k, "/")[4], ".yaml")[0])
+				if !in {
+					sigRepos[strings.Split(k, "/")[1]] =
+						append(sigRepos[strings.Split(k, "/")[1]], strings.Split(strings.Split(k, "/")[4], ".yaml")[0])
+				}
+			} else {
+				sigRepos[strings.Split(k, "/")[1]] = []string{strings.Split(strings.Split(k, "/")[4], ".yaml")[0]}
+			}
+		}
+	}
+
+	return r
+}
+
+func (e *expectState) getChangedOwnersFilesPaths(allFiles, compareFiles map[string]string) map[string]string {
+
+	r := make(map[string]string, 0)
+
+	for k, v := range allFiles {
+		if strings.HasPrefix(k, e.sigDir) && strings.HasSuffix(k, "OWNERS") {
+			if _, ok := compareFiles[k]; ok {
+				if compareFiles[k] != v {
+					r[k] = v
+					compareFiles[k] = v
+				}
+			} else {
+				r[k] = v
+				compareFiles[k] = v
+			}
+		}
+	}
+
+	return r
+}
+
+func findInSlice(s []string, k string) (in bool) {
+
+	in = false
+	for _, j := range s {
+		if j == k {
+			in = true
+		} else {
+			continue
+		}
+	}
+
+	return in
+}
+
+func (e *expectState) removeDeletedRepos(allFiles map[string]string, org string) {
+	l := make(map[string][]string, 0)
+	for k := range allFiles {
+		if strings.HasPrefix(k, e.sigDir) && !strings.HasSuffix(k, ".md") &&
+			strings.Count(k, "/") == 4 && strings.Contains(k, org) {
+			l[strings.Split(k, "/")[1]] = append(l[strings.Split(k, "/")[1]], strings.Split(strings.Split(k, "/")[4], ".yaml")[0])
+		}
+	}
+	for k, v := range l {
+		o := sigRepos[k]
+		newO := sets.NewString(v...)
+		oldO := sets.NewString(o...)
+
+		if needToDelete := oldO.Difference(newO); needToDelete.Len() > 0 {
+			for i := range needToDelete {
+				delete(community.ReposMap, i)
+				delete(repos, fmt.Sprintf("%s/%s/%s/%s/%s", e.sigDir, k, org, strings.ToLower(i[:1]), i))
+
+				for j := 0; j < len(sigRepos[k]); j++ {
+					if sigRepos[k][j] == i {
+						sigRepos[k] = append(sigRepos[k][:j], sigRepos[k][j+1:]...)
+						j--
+					}
+				}
+			}
+		}
+
+	}
+}
+
+func getFirstLevelFilesSha(e *expectState) string {
+	tree, err := e.cli.GetDirectoryTree(e.w.Org, e.w.Repo, e.w.Branch, 0)
+	if err != nil || len(tree.Tree) == 0 {
+		e.log.Errorf("list all file, err:%s", err)
+
+		return ""
+	}
+
+	for i := range tree.Tree {
+		item := &tree.Tree[i]
+		if item.Path == e.sigDir {
+			return item.Sha
+		}
+	}
+
+	return ""
 }
