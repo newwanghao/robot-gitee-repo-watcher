@@ -13,6 +13,7 @@ import (
 
 func (bot *robot) createRepo(
 	expectRepo expectRepoInfo,
+	sigLabel string,
 	log *logrus.Entry,
 	hook func(string, *logrus.Entry),
 ) models.RepoState {
@@ -21,13 +22,13 @@ func (bot *robot) createRepo(
 	repoName := expectRepo.getNewRepoName()
 
 	if n := repo.RenameFrom; n != "" && n != repoName {
-		return bot.renameRepo(expectRepo, log, hook)
+		return bot.renameRepo(expectRepo, sigLabel, log, hook)
 	}
 
 	log = log.WithField("create repo", repoName)
 	log.Info("start")
 
-	property, err := bot.newRepo(org, repo)
+	property, err := bot.newRepo(org, repo, sigLabel)
 	if err != nil {
 		log.Warning("repo exists already")
 
@@ -58,7 +59,7 @@ func (bot *robot) createRepo(
 	}
 }
 
-func (bot *robot) newRepo(org string, repo *community.Repository) (models.RepoProperty, error) {
+func (bot *robot) newRepo(org string, repo *community.Repository, sigLabel string) (models.RepoProperty, error) {
 	err := bot.cli.CreateRepo(org, sdk.RepositoryPostParam{
 		Name:        repo.Name,
 		Description: repo.Description,
@@ -68,6 +69,11 @@ func (bot *robot) newRepo(org string, repo *community.Repository) (models.RepoPr
 		CanComment:  repo.Commentable,
 		Private:     repo.IsPrivate(),
 	})
+	if err != nil {
+		return models.RepoProperty{}, err
+	}
+
+	err = bot.cli.AddProjectLabels(org, repo.Name, []string{sigLabel})
 	if err != nil {
 		return models.RepoProperty{}, err
 	}
@@ -126,6 +132,7 @@ func (bot *robot) initNewlyCreatedRepo(
 
 func (bot *robot) renameRepo(
 	expectRepo expectRepoInfo,
+	sigLabel string,
 	log *logrus.Entry,
 	hook func(string, *logrus.Entry),
 ) models.RepoState {
@@ -160,6 +167,13 @@ func (bot *robot) renameRepo(
 		return s
 	}
 
+	if err != nil {
+		log.Error(err)
+
+		return models.RepoState{}
+	}
+
+	err = bot.cli.UpdateProjectLabels(org, newRepo, []string{sigLabel})
 	if err != nil {
 		log.Error(err)
 
@@ -210,7 +224,7 @@ func (bot *robot) initRepoReviewer(org, repo string) error {
 	)
 }
 
-func (bot *robot) updateRepo(expectRepo expectRepoInfo, lp models.RepoProperty, log *logrus.Entry) models.RepoProperty {
+func (bot *robot) updateRepo(expectRepo expectRepoInfo, lp models.RepoProperty, sigLabel string, log *logrus.Entry) models.RepoProperty {
 	org := expectRepo.org
 	repo := expectRepo.expectRepoState
 	repoName := expectRepo.getNewRepoName()
@@ -230,6 +244,14 @@ func (bot *robot) updateRepo(expectRepo expectRepoInfo, lp models.RepoProperty, 
 				Private:    strconv.FormatBool(ep),
 			},
 		)
+		if err == nil {
+			return models.RepoProperty{
+				Private:    ep,
+				CanComment: ec,
+			}
+		}
+
+		err = bot.cli.UpdateProjectLabels(org, repoName, []string{sigLabel})
 		if err == nil {
 			return models.RepoProperty{
 				Private:    ep,

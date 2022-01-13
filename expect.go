@@ -24,7 +24,7 @@ func (e *expectState) check(
 	org string,
 	isStopped func() bool,
 	clearLocal func(func(string) bool),
-	checkRepo func(*community.Repository, []string, *logrus.Entry),
+	checkRepo func(*community.Repository, []string, string, *logrus.Entry),
 ) {
 	newSigSha := getFirstLevelFilesSha(e)
 
@@ -141,7 +141,7 @@ func (e *expectState) check(
 				continue
 			}
 
-			checkRepo(community.ReposMap[repoName], owners, e.log)
+			checkRepo(community.ReposMap[repoName], owners, fmt.Sprintf("sig/%s", sigName), e.log)
 
 			done.Insert(repoName)
 		}
@@ -165,7 +165,7 @@ func (e *expectState) check(
 				continue
 			}
 
-			checkRepo(repo, nil, e.log)
+			checkRepo(repo, nil, "", e.log)
 		}
 	}
 }
